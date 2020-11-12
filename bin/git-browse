@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+
+usage() {
+    cat <<EOF
+browse remote repository
+
+usage:
+    git browse [(<rev> | <rev>:<path> | <rev> <path> | <path>)]
+
+    git browse -i [<id>]            # issues
+    git browse -p [<id>]            # PRs
+    git browse -t [<tag>]           # releases
+
+options:
+    -r <remote>                     # use remote
+    -n                              # dry-run
+EOF
+}
+
+
+exit_err() {
+    if [[ $# -eq 1 ]]; then
+        echo "$1" 1>&2
+    else
+        usage 1>&2
+    fi
+    exit 1
+}
+
+
+# resolve path when revision is given as '<rev>:<path>'
+# only paths starting with ./ or ../ should be resolved relative to top-level dir
+# other paths are expected to be already relative to the top-level dir
+# even if current working dir is not the top-level dir
+set_rev_path() {
+    path=$1
+
+    # relative paths should use ./ or ../
+    if [[ $path == '.' || $path == '..' ]]; then
+        echo "warning: revision should use a trailing slash: '$rev:$path/'"
+        path=$path/
+    fi
+
+    # resolve a relative current working dir path to be relative to the top-level dir
+    #
+    # path is in the form <rel_dir>/[<last>]
+    # (<rel_dir> always starts with ./ or ../)
+    #
+    # cd to <rel_dir> then find the prefix relative to the top-level dir;
+    # if working dir is top-level dir then prefix will be empty
+    #
+    # then resolve <rel_dir>/[<last>] to <prefix>[<last>]
+    # (<prefix> has a trailing / if not empty)
+    #
+    # note that if path is just ./ and current working dir is top-level dir,
+    # then path will be empty, i.e. revision will be the tree '<rev>:'
+    if [[ $path == ./*  || $path == ../* ]]; then
+        path=$(cd "${path%/*}" && git rev-parse --show-prefix 2>/dev/null)${path##*/} ||
+            exit_err "error: '$1' is not a valid repository path"
+    fi
+
+    # remove any trailing /
+    path=${path%/}
+}
+
+
+# resolve path when arguments are '<rev> <path>' or '<path>'
+# all paths should be resolved relative to the top-level dir
+set_cwd_path() {
+    local prefix
+    path=$1
+
+    # if path is <dir> ensure it has a trailing /
+    if [[ -d $path ]]; then
+        path=${path%/}
+        path=$path/
+    fi
+
+    # if path is <dir>/, cd to <dir> first
+    # if path is <dir>/<file>, cd to <dir> first
+    # if path is <file>, stay in current working dir
+    #
+    # then find the working dir prefix relative to the top-level dir
+    # if working dir is top-level dir then prefix will be empty
+    prefix=$([[ $path == */* ]] && cd "${path%/*}"; git rev-parse --show-prefix 2>/dev/null) ||
+        exit_err "error: '$1' is not a valid repository path"
+
+    # resolve path using the prefix (<prefix> has a trailing / if not empty)
+    # if path is <dir>/, resolve to <prefix>
+    # if path is <dir>/<file>, resolve to <prefix><file>
+    # if path is <file>, resolve to <prefix><file>
+    #
+    # note that if path is just ./ and current working dir is top-level dir,
+    # then path will be empty, i.e. revision will be the tree '<rev>:'
+    path=${prefix}${path##*/}
+
+    # remove any trailing /
+    path=${path%/}
+}
+
+
+unsupported_host() {
+    local host
+    host=${remote_url#http*://}
+    host=${host%/*/*}
+    exit_err "error: unsupported host '$host'"
+}
+
+
+open_remote_url() {
+    echo "$remote_url"
+    if [[ -n $dry_run ]]; then
+        return
+    fi
+
+    if [[ -n ${GIT_BROWSE_CMD+x} ]]; then
+        $GIT_BROWSE_CMD "$remote_url"
+        return
+    fi
+
+    case "$OSTYPE" in
+        darwin*)
+            # macOS
+            open "$remote_url"
+            ;;
+        linux*)
+            # Handle WSL on Windows
+            if uname -a | grep -i -q Microsoft; then
+                powershell.exe -NoProfile start "$remote_url"
+            else
+                xdg-open "$remote_url"
+            fi
+            ;;
+        *)
+            # fall back to xdg-open for BSDs, etc.
+            xdg-open "$remote_url"
+            ;;
+    esac
+}
+
+
+parse_remote_url() {
+    if [[ -z $remote ]]; then
+        # if <rev> was set, <branch> has been set too
+        # (to <rev> if <rev> is a branch, or empty)
+        # if not set yet, use current branch
+        : "${branch=$(git rev-parse --abbrev-ref HEAD)}"
+
+        # if <branch> is empty (i.e. <rev> is not a branch)
+        # or no remote is defined for it, fallback to 'origin'
+        remote=$(git config "branch.${branch}.remote" || echo "origin")
+
+        # could this happen?
+        if [[ -z $remote ]]; then
+            exit_err "error: remote not found"
+        fi
+    fi
+
+    # seems like the gh command adds a full URL as remote
+    # for fetched PR branches
+    if [[ $remote =~ (git@|https?://).* ]]; then
+        remote_url=$remote
+    else
+        remote_url=$(git remote get-url "$remote" 2>/dev/null) ||
+            exit_err "error: cannot get URL for remote '$remote'"
+    fi
+    if [[ $remote_url = git@* ]]; then
+        remote_url=$(echo "$remote_url" | sed -E -e 's|:|/|' -e 's|\.git$||' -e 's|.*@(.*)|https://\1|')
+    elif [[ $remote_url = http* ]]; then
+        remote_url=${remote_url%.git}
+    else
+        exit_err "error: unsupported remote URL format '$remote_url'"
+    fi
+}
+
+
+parse_issue_id() {
+    if [[ $1 =~ ^#?[0-9]+$ ]]; then
+        issue_id=$1
+        issue_id=${issue_id#\#}
+    else
+        exit_err "error: invalid id '$1'"
+    fi
+}
+
+
+parse_revision() {
+    # browse a specific commit/tag and/or tree/blob
+    if [[ $# -gt 0 ]]; then
+        # argument should be '<rev>', '<rev>:<path>' or '<path>'
+        if [[ $# -eq 1 ]]; then
+            # support rev as ':/<regex>'
+            # path is left unset, i.e., browse a commit
+            if [[ $1 == :/* ]]; then
+                rev=$1
+            # do not support ':<path>' (it refers to a blob in the index)
+            elif [[ $1 == :* ]]; then
+                exit_err "error: revision '$1' is not supported"
+            # parse '<rev>:<path>', where '<path>' may be empty (i.e. top-level tree)
+            elif [[ $1 == *:* ]]; then
+                rev=${1%:*}
+                set_rev_path "${1#*:}"
+            # an existing path
+            # rev is assumed to be current HEAD
+            elif [[ -e $1 ]]; then
+                rev=HEAD
+                set_cwd_path "$1"
+            # should be a valid rev
+            # path is left unset, i.e., browse a commit or tag
+            else
+                rev=$1
+            fi
+        # arguments should be '<rev>' and '<path>'
+        elif [[ $# -eq 2 ]]; then
+            if [[ $1 == *:* ]]; then
+                exit_err
+            fi
+            rev=$1
+            set_cwd_path "$2"
+        else
+            exit_err
+        fi
+
+        # check if <rev> is valid and if refers to a branch/tag
+        # <branch> will be empty if <rev> is not a branch/tag
+        branch=$(git rev-parse --abbrev-ref "${rev}" 2>/dev/null) ||
+            exit_err "error: unknown revision '$rev' and not such path in the working tree"
+
+        # prefer to use the branch/tag name as <rev> if possible
+        # otherwise use full hash
+        if [[ -n $branch ]]; then
+            rev=$branch
+        else
+            rev=$(git rev-parse "${rev}")
+        fi
+
+        # ensure <path> exists in <rev>
+        if [[ -n ${path+x} ]]; then
+            git cat-file -t "$rev:$path" 1>/dev/null 2>&1 ||
+                exit_err "error: path '$path' does not exist in '$rev'"
+        fi
+    fi
+}
+
+
+browse_issue() {
+    if [[ $# -gt 1 ]]; then
+        exit_err "usage: git browse -i [<id>]"
+    fi
+
+    if [[ $# -eq 1 ]]; then
+        parse_issue_id "$1"
+    fi
+
+    parse_remote_url
+
+    case "$remote_url" in
+        *github.com*)
+            if [[ -z ${issue_id} ]]; then
+                remote_url=${remote_url}/issues
+            else
+                remote_url=${remote_url}/issue/${issue_id}
+            fi
+            ;;
+        *gitlab.com*)
+            if [[ -z ${issue_id} ]]; then
+                remote_url=${remote_url}/-/issues
+            else
+                remote_url=${remote_url}/-/issues/${issue_id}
+            fi
+            ;;
+        *)
+            unsupported_host
+    esac
+
+    open_remote_url
+}
+
+
+browse_pull_request() {
+    if [[ $# -gt 1 ]]; then
+        exit_err "usage: git browse -p [<id>]"
+    fi
+
+    if [[ $# -eq 1 ]]; then
+        parse_issue_id "$1"
+    fi
+
+    parse_remote_url
+
+    case "$remote_url" in
+        *github.com*)
+            if [[ -z ${issue_id} ]]; then
+                remote_url=${remote_url}/pulls
+            else
+                remote_url=${remote_url}/pull/${issue_id}
+            fi
+            ;;
+        *gitlab.com*)
+            if [[ -z ${issue_id} ]]; then
+                remote_url=${remote_url}/-/merge_requests
+            else
+                remote_url=${remote_url}/-/merge_requests/${issue_id}
+            fi
+            ;;
+        *)
+            unsupported_host
+    esac
+
+    open_remote_url
+}
+
+
+browse_release() {
+    if [[ $# -gt 1 ]]; then
+        exit_err "usage: git browse -t [<tag>]"
+    fi
+
+    if [[ $# -eq 1 ]]; then
+        release=$1
+    fi
+
+    parse_remote_url
+
+    case "$remote_url" in
+        *github.com*)
+            if [[ -z ${release} ]]; then
+                remote_url=${remote_url}/releases
+            else
+                remote_url=${remote_url}/releases/tag/${release}
+            fi
+            ;;
+        *gitlab.com*)
+            if [[ -z ${release} ]]; then
+                remote_url=${remote_url}/-/releases
+            else
+                remote_url=${remote_url}/-/releases/${release}
+            fi
+            ;;
+        *)
+            unsupported_host
+    esac
+
+    open_remote_url
+}
+
+
+browse_revision() {
+    parse_revision "$@"
+    parse_remote_url
+
+    # go to a specific object instead of the main page of the repository
+    if [[ -n ${rev+x} ]]; then
+        # get the type of the object (commit, tree or blob)
+        # object is <rev>, or <rev>:<path> if <path> is set (could be empty)
+        obj_type=$(git cat-file -t "${rev}${path+:$path}")
+
+        # if <rev> is a branch/tag and no <path>, go to its tree
+        # just like clicking its link
+        [[ $obj_type == "commit" && $rev == "$branch" ]] && obj_type=tree
+
+        # construct the object URL
+        case "$remote_url" in
+            *github.com*)
+                remote_url="${remote_url}/${obj_type}/${rev}/${path}"
+                ;;
+            *gitlab.com*)
+                remote_url="${remote_url}/-/${obj_type}/${rev}/${path}"
+                ;;
+            *)
+                unsupported_host
+        esac
+        remote_url=${remote_url%/}
+    fi
+
+    open_remote_url
+}
+
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -r)
+            remote=$2
+            shift; shift
+            ;;
+        -i)
+            issue=
+            shift;
+            ;;
+        -p|-m)
+            pull_request=
+            shift;
+            ;;
+        -t)
+            release=
+            shift;
+            ;;
+        -n)
+            dry_run=true
+            shift
+            ;;
+        -h)
+            usage
+            exit 0
+            ;;
+        -*)
+            exit_err
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ -n ${issue+x} && -n ${pull_request+x} ]]; then
+    exit_err
+fi
+
+if [[ -n ${issue+x} ]]; then
+    browse_issue "$@"
+elif [[ -n ${pull_request+x} ]]; then
+    browse_pull_request "$@"
+elif [[ -n ${release+x} ]]; then
+    browse_release "$@"
+else
+    browse_revision "$@"
+fi

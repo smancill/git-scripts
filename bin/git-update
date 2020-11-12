@@ -1,0 +1,50 @@
+#!/bin/sh
+
+current=$(git rev-parse --abbrev-ref @)
+default=$(cat .default-branch 2>/dev/null)
+if [ -z "$default" ]; then
+    default=master
+fi
+
+echo ">>> Fetching remote branches..."
+git fetch --prune
+
+local=$(git rev-parse "$default")
+remote=$(git rev-parse "$default@{u}")
+base=$(git merge-base "$default" "$default@{u}")
+
+if [ "$local" = "$remote" ]; then
+    echo ">>> $default is up-to-date"
+    exit 0
+fi
+
+if [ "$base" = "$remote" ]; then
+    echo ">>> $default is ahead"
+    exit 0
+fi
+
+has_stash=0
+if git status --porcelain | grep -q '^.'; then
+    echo ">>> Saving working directory..."
+    if git stash save -u "git-update on $(date)"; then
+        has_stash=1
+    fi
+fi
+
+echo ">>> Updating $default branch..."
+if [ "$current" != "$default" ]; then
+    git checkout -q "$default"
+fi
+if [ "$base" = "$local" ]; then
+    git merge   # default branch is behind
+else
+    git rebase  # default branch has diverged
+fi
+
+if [ "$current" != "$default" ]; then
+    git checkout -q -
+fi
+if [ "$has_stash" -eq 1 ]; then
+    echo ">>> Restoring working directory..."
+    git -c status.short=true stash pop
+fi

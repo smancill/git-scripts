@@ -1,0 +1,40 @@
+#!/bin/sh
+
+clean_reflog() {
+    git reflog expire --stale-fix --verbose --expire-unreachable=now --all
+}
+
+clean_original() {
+    rm -rf .git/refs/original
+}
+
+clean_pack() {
+    git repack -A -d
+    git prune
+}
+
+run_gc() {
+    git gc
+}
+
+if [ $# -eq 1 ]; then
+    case "$1" in
+        reflog)
+            clean_reflog
+            ;;
+        original)
+            clean_original
+            ;;
+        pack)
+            clean_pack
+            ;;
+        -h|--help)
+            echo "usage: git clean-repo [ reflog | original | pack ]"
+            ;;
+    esac
+else
+    clean_reflog
+    clean_original
+    clean_pack
+    run_gc
+fi
