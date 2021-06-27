@@ -259,7 +259,7 @@ browse_issue() {
             if [[ -z ${issue_id} ]]; then
                 remote_url=${remote_url}/issues
             else
-                remote_url=${remote_url}/issue/${issue_id}
+                remote_url=${remote_url}/issues/${issue_id}
             fi
             ;;
         *gitlab.com*)
